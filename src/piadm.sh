@@ -12,10 +12,13 @@
 #
 
 #
-# Copyright 2021 Joyent, Inc.
+# Copyright 2022 Joyent, Inc.
+# Copyright 2025 MNX Cloud, Inc.
+# Copyright 2026 Edgecast Cloud LLC.
 #
 
 # shellcheck disable=1091
+
 . /lib/sdc/usb-key.sh
 
 eecho() {
@@ -30,7 +33,7 @@ err() {
 fatal() {
 	eecho
 	if [[ -n "$1" ]]; then
-		eecho "ERROR: $1"
+		eecho "ERROR: $@"
 	fi
 	eecho
 	exit 2
@@ -41,6 +44,9 @@ corrupt() {
 	exit 3
 }
 
+# Only run in the global zone.
+[[ "$(zonename)" == "global" ]] || err "Must run piadm in the global zone"
+
 usage() {
 	eecho ""
 	eecho "Usage: piadm [-v] <command> [command-specific arguments]"
@@ -48,9 +54,9 @@ usage() {
 	eecho "    piadm activate|assign <PI-stamp> [ZFS-pool-name]"
 	eecho "    piadm avail"
 	eecho "    piadm bootable [-d] [-e [-i <source>]] [-r] [ZFS-pool-name]"
+	eecho "    piadm destroy|remove <PI-stamp> [ZFS-pool-name]"
 	eecho "    piadm install <source> [ZFS-pool-name]"
 	eecho "    piadm list <-H> [ZFS-pool-name]"
-	eecho "    piadm remove <PI-stamp> [ZFS-pool-name]"
 	eecho "    piadm update [ZFS-pool-name]"
 	err ""
 }
@@ -83,6 +89,16 @@ vecho() {
 declare bootfs
 declare -a allbootfs
 declare numbootfs
+
+#
+# Privilege check.  For now, lets just make sure we're root (user 0).
+# NOTE: Global zone check was earlier, but some subcommands do NOT
+# need privilege, so functionalize that check here for easy naming,
+# and potential for more sophistication later.
+#
+privcheck() {
+	[[ "$(id -u)" == 0 ]] || err "Must be root for $1"
+}
 
 #
 # Inventory pools and bootable file systems.
@@ -163,13 +179,194 @@ piname_present_get_bootfs() {
 
 # Defined as a variable in case we need to add parameters (like -s) to it.
 # WARNING:  Including -k for now.
-CURL=( curl -ks -f )
+CURL=( curl -ks -f --show-error)
+VCURL=( curl -k -f --progress-bar)
 
-# Well-known source of SmartOS Platform Images
-DEFAULT_URL_PREFIX=https://us-east.manta.joyent.com/Joyent_Dev/public/SmartOS/
+vcurl() {
+	if [[ $VERBOSE -eq 1 ]]; then
+		# Verbose curls show progress.
+		"${VCURL[@]}" "$@"
+	else
+		# Non-verbose ones do not.
+		"${CURL[@]}" "$@"
+	fi
+}
 
-# Can be overridden by the user's PIADM_URL_PREFIX.
-URL_PREFIX=${PIADM_URL_PREFIX:-${DEFAULT_URL_PREFIX}}
+# Default well-known source of SmartOS Platform Images
+DEFAULT_URL_PREFIX=https://us-central.manta.mnx.io/Joyent_Dev/public/SmartOS/
+# Default path for piadm's configuration
+PIADM_CONF=/var/piadm/piadm.conf
+
+# fetch_csum
+#
+# Fetches checksums using a platform file as the key.
+#
+# Arguments:
+#   $1 - URL from where to fetch the PI from. The name of the PI
+#   	 is expected to be the last path component of the URL,
+#   	 or the literal string "latest".
+#
+# Environment Variables:
+#   PIADM_NO_SUM     - If set to 1, skips checksum validation.
+#   PIADM_SUM_URL    - If set, overrides the default URL used
+#                      the checksum file used for platform images.
+#
+# Notes:
+#   - If "latest" is used, up to 1024 PIs will be listed from ${URL_PREFIX}.
+#     The last one is assumed to be the latest.
+#   - On error, this function exits with code 1, following piadm(8)
+#     convention: the error indicates a failure, but no changes were made
+#     to the system.
+declare csum_platform=""
+declare stamp=""
+fetch_csum() {
+	if [[ -z "$csum_platform" ]]; then
+		local platform_file
+		if [[ "$1" != "latest" ]]; then
+			IFS='/' read -ra array <<< "$1"
+			platform_file="${array[-1]}"
+			stamp="${array[-2]}"
+		else
+			#latest is a special case, we need find out stamp
+			stamps_url="${URL_PREFIX%/}?limit=1024"
+			stamp=$("${CURL[@]}" "${stamps_url}" |\
+				json -ga -c "this.name.match(/Z$/)" | json -ag name |\
+				sort  | tail -1; exit "${PIPESTATUS[0]}")
+			code=$?
+			if [[ $code -ne 0 ]]; then
+				eecho "Curl failed fetching PI data from ${stamps_url}"
+				return 1
+			fi
+			platform_file="smartos-${stamp}.iso"
+		fi
+		if [[ -z ${PIADM_SUM_URL} ]];then
+			local csum_url="${URL_PREFIX}${stamp}/${PIADM_DIGEST_ALGORITHM:-md5}sums.txt"
+		else
+			local csum_url="${PIADM_SUM_URL}"
+		fi
+		csum_platform=$("${CURL[@]}"  "${csum_url}" |\
+			awk -v pattern="${platform_file}"\
+			'$0 ~ pattern { print $1; exit}'; exit "${PIPESTATUS[0]}")
+		code=$?
+		if [[ $code -ne 0 ]]; then
+			eecho "fetching checksums from ${csum_url}"
+			#force re-calculation of checksum on the next call.
+			csum_platform=""
+			stamp=""
+			return 1
+		fi
+	fi
+	echo "${csum_platform}"
+	return 0
+}
+
+# validate_csum
+#
+# $1 is the URL from where the PI was downloaded.
+# $2 is the on disk PI image that was download from $1.
+#
+# Error code will always be 1, following the piadm(8) convention where
+# a return code of 1 means: an error has occurred, but no change was made.
+# Environment variable PIADM_DIGEST_ALGORITHM controls the checksum
+# algorithm used by digest(1), by default md5 is used.  
+validate_csum() {
+	if [[ $PIADM_NO_SUM -eq 1 ]]; then
+		vecho "WARNING: Not using validation checksum"
+		return 0
+	fi
+	published_csum=$(fetch_csum "$1")
+	code=$?
+	if [[ $code -ne 0 ]]; then
+		eecho "Could not get checksum for PI exit code: ${code}"
+		return 1
+	fi
+	local_csum=$(digest -a "${PIADM_DIGEST_ALGORITHM:-md5}" "${2}")
+	code=$?
+	if [[ $code -ne 0 ]]; then
+		eecho "checksum failed for $2, algorithm used: ${PIADM_DIGEST_ALGORITHM}"
+		return 1
+	fi
+	vecho "published_checksum: ${published_csum}"
+	vecho "local_checksum:     ${local_csum}"
+	if [[ "${published_csum}" != "${local_csum}" ]]; then
+		eecho  "local file does not match published checksum"
+		return 1
+	fi
+	return 0
+}
+
+#
+# (Re)-Configure the default URL (and potentially other things in the future)
+# using the configuration file (in $PIADM_CONF).
+#
+config_check() {
+	# Can't do standalone_only per se as it errors out, but this only
+	# applies to standalone SmartOS.
+	if [[ "$TRITON_CN" == "yes" || "$TRITON_HN" == "yes" ]]; then
+		return
+	fi
+
+        if grep -sq us-east.manta.joyent.com $PIADM_CONF ; then
+            # If they have a broken config with the stale joyent name,
+            # nuke it.
+            printf 'WARNING: Removing stale image server ' >&2
+            printf '(us-east.manta.joyent.com)\n' >&2
+            rm "${PIADM_CONF:?}"
+        fi
+
+	OLD_DEFAULT="$DEFAULT_URL_PREFIX"
+	if [[ -f $PIADM_CONF ]]; then
+		. $PIADM_CONF
+	else
+		# We're creating $PIADM_CONF.
+		# NOTE: On an installation this will disappear as /var is
+		# on the ramdisk.
+		vecho "Creating $PIADM_CONF"
+		rm -rf $PIADM_CONF
+		mkdir -p /var/piadm
+
+		PIADM_CONFIG_VERSION=1
+		cat <<EOF  > $PIADM_CONF
+PIADM_CONFIG_VERSION=$PIADM_CONFIG_VERSION
+PIADM_DIGEST_ALGORITHM=\${PIADM_DIGEST_ALGORITHM:-md5}
+PIADM_NO_SUM=\${PIADM_NO_SUM:-0}
+EOF
+
+	fi
+
+	# Reality checks for PIADM_CONFIG_VERSION and more.
+	# Currently we only have one version. In the future, we will need to
+	# change that.  We will do strict string comparisons too, instead of
+	# numeric ones, to harden against corrupt piadm.conf files.
+	#
+	if [[ "$PIADM_CONFIG_VERSION" == "1" ]]; then
+		if [[ $VERBOSE -eq 1 ]]; then
+			echo "Version 1 of $PIADM_CONF"
+			echo "The following file contents have been configured:"
+			echo ""
+			cat $PIADM_CONF
+			echo ""
+			if [[ "$OLD_DEFAULT" != "$DEFAULT_URL_PREFIX" ]]; then
+				echo "DEFAULT_URL_PREFIX was $OLD_DEFAULT ,"
+				echo "but now is $DEFAULT_URL_PREFIX"
+			fi
+		fi
+	else
+		eecho "WARNING: Bad config file version: $PIADM_CONFIG_VERSION"
+		err "Please fix, or delete, $PIADM_CONF and run again"
+	fi
+
+	# Can furthermore be overridden by the user's PIADM_URL_PREFIX.
+	URL_PREFIX=${PIADM_URL_PREFIX:-${DEFAULT_URL_PREFIX}}
+	
+	# Allow environment variables to override config file values
+	[[ -n "${PIADM_DIGEST_ALGORITHM}" ]] && export PIADM_DIGEST_ALGORITHM
+	[[ -n "${PIADM_NO_SUM}" ]] && export PIADM_NO_SUM
+	[[ -n "${PIADM_URL_PREFIX}" ]] && URL_PREFIX="${PIADM_URL_PREFIX}"
+	[[ -n "${PIADM_SUM_URL}" ]] && export PIADM_SUM_URL
+
+	source "${PIADM_CONF}"
+}
 
 avail() {
 	# For now, assume that the URL_PREFIX points to a Manta
@@ -184,10 +381,23 @@ avail() {
 		eecho ""
 	fi
 
+	# We need to get a list of all installed PIs to exclude them from
+	# the list of available. By definition, a PI is available only if it is:
+	# * newer than the current PI
+	# * not already installed
+	getbootable
+	tmp=$(mktemp)
+	for bootfs in "${allbootfs[@]}"; do
+		cat /"${bootfs}"/platform-*/etc/version/platform > "$tmp"
+	done
+
 	# The aforementioned Manta method, parsed by json(1).
-	# Don't print ones old enough to NOT contain piadm(1M) itself.
+	# Don't print ones old enough to NOT contain piadm(8) itself.
+	# Always be silent (i.e. use ${CURL[@]}).
 	"${CURL[@]}" "${URL_PREFIX}/?limit=1000" | json -ga -c \
-		"this.name.match(/Z$/) && this.name>=\"$activestamp\"" name
+		"this.name.match(/Z$/) && this.name>=\"$activestamp\"" name | \
+		grep -v -f "$tmp"
+	rm -f "${tmp:?}"
 }
 
 # Scan for available installation media and mount it.
@@ -239,16 +449,25 @@ install() {
 		# URL_PREFIX.  Grab the latest-version ISO. Before proceeding,
 		# make sure it's the current one.
 		iso=yes
-		"${CURL[@]}" -o "${tdir}/smartos.iso" "${URL_PREFIX}/smartos-latest.iso"
+		vecho "Downloading latest SmartOS ISO"
+		vcurl -o "${tdir}/smartos.iso" "${URL_PREFIX}/smartos-latest.iso"
 		code=$?
 		if [[ $code -ne 0 ]]; then
 			/bin/rm -rf "${tdir}"
 			fatal "Curl exit code $code"
 		fi
+		validate_csum "$1" "${tdir}/smartos.iso"
+		code=$?
+		if [[ $code -ne 0 ]]; then
+			/bin/rm -rf "${tdir}"
+			err "Cannot validate checksum for $1"
+		fi
 		mount -F hsfs "${tdir}/smartos.iso" "${tdir}/mnt"
-
-		# For now, assume boot stamp and PI stamp are the same on an ISO...
-		stamp=$(cat "${tdir}/mnt/etc/version/boot")
+		# if user disabled checksums, we don't have a stamp.
+		if [[ -z "${stamp}" ]]; then
+			# For now, assume boot stamp and PI stamp are the same on an ISO...
+			stamp=$(cat "${tdir}/mnt/etc/version/boot")
+		fi
 	elif [[ "$1" == "media" ]]; then
 		# Scan the available media to find what we seek.  Same advice
 		# about making sure it's the current one.
@@ -258,9 +477,12 @@ install() {
 			err "Cannot find install media"
 		fi
 
-		# For now, assume boot stamp and PI stamp are the same on
-		# install media.
-		stamp=$(cat "${tdir}/mnt/etc/version/boot")
+		# if user disabled checksums, we don't have a stamp.
+		if [[ -z "${stamp}" ]]; then
+			# For now, assume boot stamp and PI stamp are the same on
+			# install media.
+			stamp=$(cat "${tdir}/mnt/etc/version/boot")
+		fi
 	elif [[ -f $1 ]]; then
 		# File input!  Check for what kind, etc. etc.
 
@@ -268,9 +490,13 @@ install() {
 		filetype=$(file "$1" | awk '{print $2}')
 		if [[ "$filetype" == "ISO" ]]; then
 			# Assume .iso file.
+			vecho "Treating $1 as an ISO file."
 			iso=yes
 			mount -F hsfs "$1" "${tdir}/mnt"
-			stamp=$(cat "${tdir}/mnt/etc/version/boot")
+			# if user disabled checksums, we don't have a stamp.
+			if [[ -z "${stamp}" ]]; then
+				stamp=$(cat "${tdir}/mnt/etc/version/boot")
+			fi
 		elif [[ "$filetype" == "gzip" ]]; then
 			# SmartOS PI.  Let's confirm it's actually a .tgz...
 
@@ -281,10 +507,14 @@ install() {
 			# We're most-likely good here.  NOTE: SmartOS/Triton
 			# PI files expand to platform-$STAMP.  Fix it here
 			# before proceeding.
+			vecho "Treating $1 as an .tgz Platform Image file."
 			gtar -xzf "$1" -C "${tdir}/mnt"
 			mv "${tdir}"/mnt/platform-* "${tdir}/mnt/platform"
 			iso=no
-			stamp=$(cat "${tdir}/mnt/platform/etc/version/platform")
+			# if user disabled checksums, we don't have a stamp.
+			if [[ -z "${stamp}" ]]; then
+				stamp=$(cat "${tdir}/mnt/platform/etc/version/platform")
+			fi
 		else
 			/bin/rm -rf "${tdir:?}"
 			err "Unknown file type for $1"
@@ -292,20 +522,38 @@ install() {
 	else
 		# Explicit boot stamp or URL.
 
-		# Do a URL reality check.
-		"${CURL[@]}" -o "${tdir}/download" "$1"
-		if [[ -e ${tdir}/download ]]; then
-			# Recurse with the downloaded file.
-			dload=$(mktemp)
-			mv -f "${tdir}/download" "$dload"
-			/bin/rm -rf "${tdir}"
-
-			# in case `install` exits out early...
-			( pwait $$ ; rm -f "$dload" ) &
-			vecho "Installing $1"
-			vecho "	   (downloaded to $dload)"
-			install "$dload" "$2"
-			return 0
+		# Check if URL exists first
+		# We believe max-time 30s to fetch headers
+		# is more than enough.
+		vecho "Checking if URL $1 exists (30s) timeout"
+		if ! "${CURL[@]}" --max-time 30 --connect-timeout \
+				10 --head "$1" -w "%{http_code}" \
+				-o /dev/null > /var/run/piadm.http.$$ 2>/dev/null; then
+			# Get HTTP status code for error reporting
+			http_code=$(cat /var/run/piadm.http.$$)
+			/bin/rm -f /var/run/piadm.http.$$
+			if [[ -n "$http_code" && "$http_code" != "000" ]]; then
+				vecho "URL $1 returned HTTP Status: $http_code"
+			fi
+			# Fall through to treat as boot stamp
+		else
+		    /bin/rm -f /var/run/piadm.http.$$
+			vecho "Downloading from URL $1"
+			if vcurl -o "${tdir}/download" "$1"; then
+				# Recurse with the downloaded file.
+				dload=$(mktemp)
+				mv -f "${tdir}/download" "$dload"
+				/bin/rm -rf "${tdir}"
+				# in case `install` exits out early...
+				( pwait $$ ; rm -f "$dload" ) &
+				vecho "Installing $1"
+				vecho "	   (downloaded to $dload)"
+				install "$dload" "$2"
+				return 0
+			else
+				vecho "Failed to download from URL $1"
+				# Fall through to treat as boot stamp
+			fi
 		fi
 		# Else we treat it like a boot stamp.
 
@@ -319,17 +567,25 @@ install() {
 
 		# Confirm this is a legitimate build stamp.
 		# Use conventions from site hosted in URL_PREFIX.
+		vecho "Downloading ISO for Platform Image $1"
 		checkurl=${URL_PREFIX}/$1/index.html
+		# Always be silent, use ${CURL[@]}.
 		if ! "${CURL[@]}" "$checkurl" | head | grep -qv "not found" ; then
 			eecho "PI-stamp $1" \
 				"is invalid for download from $URL_PREFIX"
 			usage
 		fi
-		"${CURL[@]}" -o "${tdir}/smartos.iso" "${URL_PREFIX}/$1/smartos-${1}.iso"
+		vcurl -o "${tdir}/smartos.iso" "${URL_PREFIX}/$1/smartos-${1}.iso"
 		code=$?
 		if [[ $code -ne 0 ]]; then
 			/bin/rm -rf "${tdir}"
 			fatal "PI-stamp $1 -- curl exit code $code"
+		fi
+		validate_csum "${URL_PREFIX}/$1/smartos-${1}.iso" "${tdir}/smartos.iso"
+ 		code=$?
+		if [[ $code -ne 0 ]]; then
+			/bin/rm -rf "${tdir}"
+			err "validate_csum exit code  $code"
 		fi
 		mount -F hsfs "${tdir}/smartos.iso" "${tdir}/mnt"
 		code=$?
@@ -521,13 +777,15 @@ update_boot_sectors() {
 
 		# Use fstyp to confirm if this is a manually created EFI
 		# System Partition (ESP)
-		type=$(fstyp "/dev/dsk/${boot_devices[0]}s0")
+		type=$(fstyp "/dev/dsk/${boot_devices[0]}s0" 2>/dev/null)
 		if [[ "$type" == "pcfs" ]]; then
 			# If we detect PCFS on s0, it's LIKELY an EFI System
 			# Partition that was crafted manually.  Use s1 if it's
 			# ZFS, or bail if it's not.
 
-			s1type=$(fstyp "/dev/dsk/${boot_devices[0]}s1")
+			s1type=$(
+			    fstyp "/dev/dsk/${boot_devices[0]}s1" 2>/dev/null
+			)
 			if [[ "$s1type" != "zfs" ]]; then
 				fatal "Unusual configuration," \
 					"${boot_devices[0]}s1 not ZFS"
@@ -588,6 +846,151 @@ update_boot_sectors() {
 	fi
 }
 
+#
+# Emit a select-a-Platform-Image page header.  Set the menuset prefix!
+#
+# PWD is /${bootfs} at this point.
+#
+emit_pageheader() {
+	pagenum=$1
+	totalpages=$2
+	defaultpi=$3
+
+	if [[ "$pagenum" == "$totalpages" ]]; then
+		nextpage=3
+	else
+		nextpage=$((pagenum + 3))
+	fi
+	menusetnum=$((pagenum + 2))
+	menusetprefix="pi${pagenum}menu_"
+	cat >> ./os/pi.rc <<EOF
+set menuset_name${menusetnum}="pi${pagenum}"
+set ${menusetprefix}init[1]="init_pi"
+
+set ${menusetprefix}caption[1]="Back to Main Menu [Backspace]"
+set ${menusetprefix}command[1]="pi_draw_screen drop 1 goto_menu"
+set ${menusetprefix}keycode[1]=8
+set pi${pagenum}ansi_caption[1]="Back to Main Menu ^[1m[Backspace]^[m"
+
+set ${menusetprefix}caption[2]="[P]age: ${pagenum} of ${totalpages}"
+set ${menusetprefix}command[2]="${nextpage} goto_menu"
+set ${menusetprefix}keycode[2]=112
+set pi${pagenum}ansi_caption[2]="^[1mP^[mage: ${pagenum} of ${totalpages}"
+
+set ${menusetprefix}options=3
+EOF
+	# Need printf(1) so the shell doesn't attempt expansion...
+	printf 'set %soptionstext="${pimenu_optionstext}"\n' \
+		$menusetprefix >> ./os/pi.rc
+	cat >> ./os/pi.rc <<EOF
+
+set ${menusetprefix}caption[3]="[D]efault (${defaultpi})"
+set ${menusetprefix}command[3]="s\" set bootpi=default\" evaluate pi_unload pi_draw_screen"
+set ${menusetprefix}keycode[3]=100
+set pi${pagenum}ansi_caption[3]="^[1mD^[mefault (${defaultpi})"
+
+EOF
+
+
+
+	echo $menusetprefix
+}
+
+#
+# Create the /$bootfs/os/ directory from scratch.  This includes a
+# /bin/rm -rf of the old /$bootfs/os/ directory if it exists.
+#
+# The os/ directory, inspired by the Triton Head Node, allows a
+# selection of specific platform images that aren't the "default" as
+# symlinked into /$bootfs/platform/.  It is comprised of:
+#
+# os/pi.rc --> Generated by this function, it is a list of up to three
+# menu pages of alternate platform images, NOT INCLUDING the "default"
+# one per above.  If $bootfs has too many PIs, this function should
+# take the most recent as sorted by stamp date.
+#
+# os/$STAMP/platform --> symbolic links to ../../platform-$STAMP/.
+# Because "platform" is the last path component this way, the kernel
+# will not seek a boot archive in the default /$bootfs/platform directory.
+# NOTE that the default one wll not have a os/$DEFAULTSTAMP/platform entry.
+#
+# PWD is /${bootfs} at this point.
+#
+regenerate_os() {
+	# Clobber old one now, generate a new one, and setup the extra
+	# main-menu item..
+	vecho "Removing old ./os/ directory"
+	/bin/rm -rf ./os
+
+	# Only use "maxpis" newest PI stamps, which must be 15 or fewer.
+	# Note that the default PI is not counted amongst the 15.
+	maxpis=15
+	pisperpage=5
+
+	defaultpi=$(cat ./platform/etc/version/platform)
+	mapfile -t pis < <(cat platform-*/etc/version/platform | \
+		grep -v ${defaultpi} | sort -r | head -${maxpis})
+	totalpis=${#pis[@]}
+	if [[ "$totalpis" == "0" ]]; then
+		vecho "No need for the ./os/ directory, only one PI"
+		return
+	fi
+
+	vecho "Creating new ./os/ directory"
+	mkdir ./os
+	cat > ./os/pi.rc <<EOF
+\\
+\\ Generated by piadm(8).
+\\
+
+\\ Assume mainmenu_options=4 for now.
+
+set mainmenu_caption[5]="Alternate [P]latform Images..."
+set mainmenu_command[5]="3 goto_menu"
+set mainmenu_keycode[5]=112
+set mainansi_caption[5]="Alternate ^[1mP^[mlatform Images..."
+
+\\ Will be reset by init_pi (see below and in menu-commands.4th).
+set pimenu_optionstext="Platform Image: (UNINIT)"
+\\ For feeding init_pi.
+set pitext="Platform Image: "
+
+EOF
+
+	# Make sure maxpis is evenly divisible by pisperpage.  maxpages
+	# should not exceed 3 (loader limits 8 total pages, before this we've
+	# eaten 4, so eat 3 more, and save one for later).
+	maxpages=$(((maxpis + 1) / pisperpage))
+	totalpages=$((((totalpis - 1) / pisperpage) + 1))
+
+	pinum=0
+	menusetprefix=""
+
+	for pi in "${pis[@]}"; do
+		vecho "Including Platform Image ${pi}"
+		mkdir ./os/${pi}
+		ln -s ../../platform-${pi} ./os/${pi}/platform
+
+		pagenum=$((((pinum) / pisperpage) + 1))
+		itemnum=$(((pinum % pisperpage) + 1))
+		if [[ "$itemnum" == "1" ]]; then
+			menusetprefix=$(emit_pageheader $pagenum $totalpages \
+				$defaultpi)
+		fi
+		# else menusetprefix is already set for this round!
+
+		# Emit the entry.
+		cat >> ./os/pi.rc <<EOF
+
+set ${menusetprefix}caption[$((itemnum + 3))]="${pi}"
+set ${menusetprefix}command[$((itemnum + 3))]="pi_unload s\" set bootpi=${pi}\" evaluate s\" load /os/${pi}/platform/i86pc/kernel/amd64/unix\" evaluate s\" load -t rootfs /os/${pi}/platform/i86pc/amd64/boot_archive\" evaluate pi_draw_screen"
+set pi${pagenum}ansi_caption[$((itemnum + 3))]="${pi}"
+
+EOF
+		pinum=$((pinum + 1))
+	done
+}
+
 activate() {
 	pistamp=$1
 	piname_present_get_bootfs "$pistamp" "$2"
@@ -602,6 +1005,7 @@ activate() {
 		fi
 		if [[ $bootstamp == "$pistamp" ]]; then
 			vecho "NOTE: $pistamp is the current active PI."
+			regenerate_os
 			return
 		fi
 	else
@@ -638,6 +1042,7 @@ activate() {
 
 	rm -f platform
 	ln -s "./platform-$pistamp" platform
+	regenerate_os
 }
 
 remove() {
@@ -671,6 +1076,7 @@ remove() {
 		fi
 
 		/bin/rm -rf "platform-$pistamp"
+		regenerate_os
 	else
 		eecho "$pistamp is not a stamp for a PI on pool $pool"
 		usage
@@ -715,6 +1121,7 @@ initialize_as_CN() {
 	load_sdc_config
 
 	# Establish the CNAPI default boot Platform Image
+	# Always be silent, use ${CURL[@]}.
 	cnapi_domain=$("${CURL[@]}" http://"${CONFIG_sapi_domain:?}"/applications?name=sdc | json -Ha metadata.cnapi_domain)
 	CNAPI_DEFAULT_PI=$("${CURL[@]}" http://"${cnapi_domain}"/boot/default | json platform)
 }
@@ -740,7 +1147,7 @@ initialize_as_HN() {
 
 # README file for /${bootfs}/platform-ipxe/README.
 cat_readme() {
-    cat <<EOF
+	cat <<EOF
 For iPXE boots, the platform/ directory is empty.  This README, and
 the word "ipxe" in platform/etc/version/platform, are here so there's
 something in the platform/ directory to prevent piadm (especially
@@ -786,12 +1193,12 @@ install_pi_CN() {
 	ln -s . platform-"$installstamp"/platform
 
 	vecho "Pulling unix"
-	"${CURL[@]}" "$unix_path" > \
+	vcurl "$unix_path" > \
 		platform-"$installstamp"/i86pc/kernel/amd64/unix || return 1
 	for file in boot_archive boot_archive.hash boot_archive.manifest \
 		boot_archive.gitstatus; do
 		vecho "Pulling" "$file"
-		"${CURL[@]}" "${archive_prefix}"/"${file}" > \
+		vcurl "${archive_prefix}"/"${file}" > \
 			platform-"$installstamp"/i86pc/amd64/"${file}" || \
 			return 1
 	done
@@ -934,7 +1341,7 @@ update_CN() {
 		vecho "No updates needed for iPXE and its loader."
 		vecho "If you think there should be an update, run"
 		vecho "'sdcadm experimental update-gz-tools' on your"\
-			"Triton Head Node" 
+			"Triton Head Node"
 		exit 0
 	fi
 
@@ -984,7 +1391,9 @@ bringup_HN() {
 	version=$(sdc-usbkey status -j | json version)
 	if [[ "$version" != "2" ]]; then
 		# Unmount on version-mismatch...
-		usb_unmount_unless_already
+		if [[ "$stick_premounted" != "yes" ]]; then
+			sdc-usbkey unmount
+		fi
 		err "USB key must be Version 2 (loader) to install on a pool."
 	fi
 
@@ -1157,10 +1566,10 @@ refresh_or_disable_pool() {
 				# echo ""
 				# bootable | grep -v "$pool"
 				# echo ""
-				# 
+				#
 				# Then check to see if there's an
 				# actual USB key available.
-				# 
+				#
 				# tdir=$(mktemp -d)
 				# ... use new -u (force USB key search) option
 				# sdc-usbkey mount -u $tdir
@@ -1259,11 +1668,15 @@ fi
 bootparams | grep -E -q 'smartos=|headnode=' || initialize_as_CN
 bootparams | grep -q 'headnode=' && initialize_as_HN
 
+# Check the configuration file out.
+config_check
+
 cmd=$1
 shift 1
 
 case $cmd in
 	activate | assign )
+		privcheck "$cmd"
 		standalone_only "$cmd"
 		activate "$@"
 		;;
@@ -1274,24 +1687,30 @@ case $cmd in
 		;;
 
 	bootable )
+		privcheck bootable
 		bootable "$@"
 		;;
 
 	install )
+		privcheck install
 		standalone_only install
 		install "$@"
+		cd /${bootfs}
+		regenerate_os
 		;;
 
 	list )
 		list "$@"
 		;;
 
-	remove )
-		standalone_only remove
+	destroy | remove )
+		privcheck "$cmd"
+		standalone_only "$cmd"
 		remove "$@"
 		;;
 
 	update )
+		privcheck update
 		update_CN "$@"
 		;;
 

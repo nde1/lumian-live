@@ -11,6 +11,7 @@
 
 #
 # Copyright 2019 Joyent, Inc.
+# Copyright 2026 Edgecast Cloud LLC.
 #
 
 BASE =		$(CURDIR)
@@ -100,6 +101,7 @@ JS_CHECK_TARGETS=\
 	vm/node_modules/sysevent-stream.js \
 	vm/node_modules/zonecfg.js \
 	vm/node_modules/zoneevent.js \
+	vm/node_modules/cloudinit/*.js \
 	img/lib/*.js \
 	img/sbin/imgadm \
 	img/test/*.test.js \
@@ -217,6 +219,7 @@ $(KSTAT.NODE) :	LIBS +=		-lkstat
 NODE_SUBDIR_ENV = \
 			V=1 \
 			NODE_DTRACE_PROVIDER_REQUIRE=hard \
+			PYTHON="/opt/local/bin/python2.7" \
 			CC="$(GCC)" \
 			CXX="$(GXX)" \
 			CPPFLAGS="$(NODE_CPPFLAGS)" \
@@ -333,6 +336,7 @@ BUILT_SMARTDC_TARGETS = \
 	smartdc/bin/sdc-factoryreset \
 	smartdc/bin/sdc-lastcomm \
 	smartdc/bin/sdc-zfs-io-throttle \
+	smartdc/bin/pkgsrc-setup \
 	smartdc/bin/qemu-exec
 
 SMARTDC_TARGETS = $(BUILT_SMARTDC_TARGETS)
@@ -352,6 +356,7 @@ LIBSDC_TARGETS = \
 	lib/sdc/zone.sh
 
 ETC_TARGETS = \
+	etc/dhcp/eventhook \
 	etc/nodename \
 	etc/rtc_config \
 	etc/ssh/sshd_config
@@ -399,7 +404,7 @@ install: all $(SUBDIRS)
 	cp -p $(LIBSDC_TARGETS) $(DESTDIR)/lib/sdc/
 	mkdir -p $(DESTDIR)/smartdc/lib
 	cp -p $(SMARTDC_LIB_TARGETS) $(DESTDIR)/smartdc/lib
-	mkdir -p $(DESTDIR)/etc/ssh $(DESTDIR)/etc/notices
+	mkdir -p $(DESTDIR)/etc/ssh $(DESTDIR)/etc/notices $(DESTDIR)/etc/dhcp
 	for file in $(ETC_TARGETS); do \
 		cp -r $$file $(DESTDIR)/$$file; \
 	done

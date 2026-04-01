@@ -1,6 +1,30 @@
 The uefi-csm-rom.bin file is a binary generated from the uefi-edk2 package
-shipped in illumos-extra.  At the time of this writing, facilitating an
-isolated build of the uefi ROM was difficult thanks to its dependency on iasl
-to compile the ACPI tables it ships.  While it is excluded from the build until
-those issues are solved, the ROM can be built from those sources (and patches)
-provided a working iasl can be configured for the task.
+shipped in illumos-extra, where the source was from 2014 (the last time CSM
+was available).
+
+The uefi-rom.bin is a binary generated from the illumos downstream of
+uefi-edk2, specifically the il-edk2-stable202411 branch.
+
+Building the uefi ROM in illumos-extra may be able to happen again, now that
+SmartOS builds require a 2024.4 pkgsrc zone. Until we decide about moving
+uefi ROM builds into illumos-extra, a 2024.4 build zone can build a ROM from
+il-edk2-* branches as long as the following environment variables are set:
+
+GCCVER=13
+GCCPATH=/opt/local/gcc13
+GMAKE=/opt/local/bin/gmake
+GPATCH=/opt/local/bin/gpatch
+GAS=/opt/local/bin/gas
+GAR=/opt/local/bin/gar
+GLD=/opt/local/bin/gld
+GOBJCOPY=/opt/local/bin/gobjcopy
+
+If one wants to use the strap-cache gcc14 that can SmartOS, one should
+substitute the following AFTER a successful gcc14-primary SmartOS build in
+/path/to/smartos-live :
+
+GCCVER=14
+GCCPATH=/path/to/smartos-live/proto.strap/usr/gcc/14
+
+Other pkgsrc zones post-2021 (i.e. ones with `gld` present) may with with
+different settings of the above variables.

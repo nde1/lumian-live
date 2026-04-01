@@ -6,7 +6,9 @@
 #
 
 #
-# Copyright 2019, Joyent, Inc.
+# Copyright 2019 Joyent, Inc.
+# Copyright 2024 MNX Cloud, Inc.
+# Copyright 2025 Edgecast Cloud LLC.
 #
 
 #
@@ -14,7 +16,7 @@
 # It is intended to be run from the smartos-live ./output/bits/platform
 # directory during build publication. It creates an index.html fragment
 # which gets redirected to from
-# https://us-east.manta.joyent.com/Joyent_Dev/public/SmartOS/latest.html
+# https://us-central.manta.mnx.io/Joyent_Dev/public/SmartOS/latest.html
 #
 # The latest.html file above gets created by the 'smartos-release' script
 # which is run as part of the biweekly release process.
@@ -27,4 +29,5 @@ for x in `ls * | grep -v index.html`; do
   echo "<a href=\"$x\">$x</a><br>"
 done
 echo "<a href=\"md5sums.txt\">md5sums.txt</a>"
+echo "<a href=\"sha256sums.txt\">sha256sums.txt</a>"
 echo "</body></html>"

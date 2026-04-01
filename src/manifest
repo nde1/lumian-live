@@ -825,6 +825,10 @@ f usr/vm/node_modules/vminfod/vminfod.js 0644 root root
 f usr/vm/node_modules/vminfod/zpoolwatcher.js 0644 root root
 f usr/vm/node_modules/vminfod/zonewatcher.js 0644 root root
 f usr/vm/node_modules/vminfod/client.js 0644 root root
+d usr/vm/node_modules/cloudinit 0755 root root
+f usr/vm/node_modules/cloudinit/index.js 0644 root root
+f usr/vm/node_modules/cloudinit/lofs-fat16.js 0644 root root
+f usr/vm/node_modules/cloudinit/nocloud.js 0644 root root
 f usr/vm/node_modules/VM.js 0444 root bin
 f usr/vm/node_modules/zonecfg.js 0444 root bin
 f usr/vm/node_modules/zoneevent.js 0444 root bin
@@ -1072,6 +1076,8 @@ s usr/lib/amd64/libdemangle.so=libdemangle.so.1
 f usr/lib/amd64/libiostream.so.1 0755 root bin
 # 0-livesrc-stamp
 f .smartdc_version 0444 root root
+d etc/dhcp 0755 root sys
+f etc/dhcp/eventhook 0755 root sys
 d etc/ssh 0755 root sys
 f etc/ssh/sshd_config 0644 root sys
 f etc/rtc_config 0644 root root
@@ -1085,6 +1091,7 @@ f lib/sdc/usb-key.sh 0444 root bin
 f lib/sdc/zone.sh 0444 root bin
 d smartdc 0555 root bin
 d smartdc/bin 0555 root bin
+f smartdc/bin/pkgsrc-setup 0555 root bin
 f smartdc/bin/qemu-exec 0555 root bin
 f smartdc/bin/sdc-factoryreset 0555 root bin
 f smartdc/bin/sdc-lastcomm 0555 root bin

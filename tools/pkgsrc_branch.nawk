@@ -1,4 +1,4 @@
-#!/opt/local/bin/nawk -f
+#!/usr/bin/awk -f
 #
 # This file and its contents are supplied under the terms of the
 # Common Development and Distribution License ("CDDL"), version 1.0.
@@ -10,6 +10,7 @@
 # http://www.illumos.org/license/CDDL.
 #
 # Copyright 2018 Joyent, Inc.
+# Copyright 2024 MNX Cloud, Inc.
 #
 # Determine pkgsrc branch given a repositories.conf file.
 #
@@ -32,7 +33,7 @@ BEGIN {
 	next;
 }
 
-$3 != "pkgsrc.joyent.com" || $4 != "packages" {
+$3 != "pkgsrc.smartos.org" && $3 != "pkgsrc.joyent.com" || $4 != "packages" {
 	print("WARNING: unexpected URL format: " $0) >"/dev/stderr";
 	next;
 }
