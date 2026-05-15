@@ -30,7 +30,10 @@ ber_arg0=$(basename $0)
 ber_wsroot=$(cd "$(dirname "$0")/.." && pwd)
 ber_first=true
 
-ber_template="                     SmartOS %%VERSION%% x86_64
+ber_template="                     LumianOS %%VERSION%% x86_64
+                    Copyright %%YEAR%% Lumian
+                    Based on SmartOS and illumos
+
                     Copyright %%YEAR%% Edgecast Cloud LLC.
 
   Built with the following components:
